@@ -543,13 +543,25 @@ fn folder_bus(s: &Session, folder: TrackId) -> Option<Route> {
     s.track(folder).map(|folder| folder.mixer.input.clone()).filter(|route| matches!(route, Route::Bus(_)))
 }
 
-/// The summing bus owned by a routing folder.
-fn owned_folder_bus(s: &Session, folder: TrackId) -> Option<soundcraft_model::BusId> {
+/// The bus a routing folder currently returns, if its input is a bus.
+///
+/// This is not ownership. `track.input` or a session file can point a folder at any bus.
+fn folder_input_bus(s: &Session, folder: TrackId) -> Option<soundcraft_model::BusId> {
     let folder = s.track(folder).filter(|track| track.kind == TrackKind::Folder)?;
     match folder.mixer.input {
         Route::Bus(id) => Some(id),
         _ => None,
     }
+}
+
+/// Whether a surviving track returns `bus` or sends to it.
+///
+/// Outputs do not count. Once the folder's members have been promoted, a leftover
+/// output is rerouted onto the parent path if the bus is removed, so that audio
+/// stays audible. An input or a send belongs to someone else.
+fn bus_has_return_or_send(s: &Session, bus: soundcraft_model::BusId) -> bool {
+    let uses = |route: &Route| matches!(route, Route::Bus(id) if *id == bus);
+    s.tracks.iter().any(|track| uses(&track.mixer.input) || track.mixer.sends.iter().any(|send| send.as_ref().is_some_and(|send| uses(&send.target))))
 }
 
 /// Keep only the selected roots so selecting a folder and one of its children preserves the subtree.
@@ -639,7 +651,7 @@ fn delete(e: &mut Engine, p: &Value) -> Result<Value> {
     let removed_busses: Vec<_> = tracks
         .iter()
         .filter_map(|folder| {
-            let bus = owned_folder_bus(s, *folder)?;
+            let bus = folder_input_bus(s, *folder)?;
             let mut parent = s.track(*folder).and_then(|folder| folder.folder);
             for _ in 0..64 {
                 match parent {
@@ -681,6 +693,12 @@ fn delete(e: &mut Engine, p: &Value) -> Result<Value> {
         g.members.retain(|t| !tracks.contains(t));
     }
     for (bus, replacement) in removed_busses {
+        // Children of the deleted folder have already been promoted off this bus.
+        // Another return or send means the folder did not own it (its input was
+        // pointed at a shared bus). Dropping it would wipe that routing. #914
+        if bus_has_return_or_send(s, bus) {
+            continue;
+        }
         s.busses.retain(|candidate| candidate.id != bus);
         for track in &mut s.tracks {
             if track.mixer.input == Route::Bus(bus) {
@@ -1074,6 +1092,33 @@ mod tests {
         assert_eq!(kick.mixer.output, Route::Main);
         assert!(e.session().bus(inner_bus).is_none(), "the deleted folder's owned bus must be removed");
         assert!(e.session().bus(outer_bus).is_some(), "the surviving parent folder's bus must remain");
+    }
+
+    #[test]
+    fn deleting_a_folder_keeps_a_shared_bus_it_does_not_own() {
+        let mut e = crate::demo::demo_engine();
+        let verb = e.session().bus_by_name("Verb").unwrap().id;
+        let verb_sends = |e: &Engine| {
+            e.session().tracks.iter().filter(|track| track.mixer.sends.iter().flatten().any(|send| send.target == Route::Bus(verb))).count()
+        };
+        let sends_before = verb_sends(&e);
+        assert!(sends_before > 0, "the demo session sends to Verb");
+
+        // Point the folder at the shared reverb bus, then sum a member through it.
+        let created = e.execute("track.new", &json!({"kind": "folder", "name": "Guitars"})).unwrap();
+        let folder = created["tracks"][0].as_u64().unwrap();
+        e.execute("track.input", &json!({"tracks": [folder], "input": "Verb"})).unwrap();
+        e.execute("track.move_to_folder", &json!({"tracks": ["Kick"], "folder": folder})).unwrap();
+        assert_eq!(e.session().track_by_name("Kick").unwrap().mixer.output, Route::Bus(verb));
+
+        e.execute("track.delete", &json!({"tracks": [folder]})).unwrap();
+
+        assert!(e.session().bus(verb).is_some(), "deleting a folder must not remove a bus it does not own");
+        assert_eq!(verb_sends(&e), sends_before, "sends to that bus must survive");
+        assert_eq!(e.session().track_by_name("Verb").unwrap().mixer.input, Route::Bus(verb));
+        let kick = e.session().track_by_name("Kick").unwrap();
+        assert_eq!(kick.folder, None);
+        assert_eq!(kick.mixer.output, Route::Main);
     }
 
     #[test]
